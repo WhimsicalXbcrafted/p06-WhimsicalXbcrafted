@@ -199,8 +199,17 @@ class Engine(BaseEngine):
             if self.image.mode == "1":
                 target_mode = "RGB"
             else:
-                # convert() figures out RGB or RGBA based on palette used
-                target_mode = None
+                # P-mode images may have a transparency key in image.info.
+                # If it's binary (int or bytes of length 1), convert to RGBA
+                # so alpha is preserved through resize. For full alpha masks
+                # (longer bytes strings), let PIL choose RGB vs RGBA.
+                transparency = self.image.info.get("transparency")
+                if isinstance(transparency, (int, bytes)) and (
+                    isinstance(transparency, int) or len(transparency) <= 1
+                ):
+                    target_mode = "RGBA"
+                else:
+                    target_mode = None
             self.image = self.image.convert(mode=target_mode)
 
         size = (int(width), int(height))
@@ -277,6 +286,47 @@ class Engine(BaseEngine):
                     else None
                 )
                 self.image = self.image.quantize(method=quantize_method)
+
+                # quantize() on an RGBA image produces a P-mode image but
+                # drops the transparency info. If the original was P-mode
+                # (GIF) and the resized RGBA image has transparent pixels,
+                # find the palette index with alpha=0 and set it as the
+                # transparency key. Only do this for GIF output; PNG output
+                # with partial alpha should keep RGBA mode instead.
+                if (
+                    self.original_mode == "P"
+                    and requested_extension in (None, ".gif")
+                ):
+                    rgba_check = self.image.convert("RGBA")
+                    alpha_extrema = rgba_check.getchannel("A").getextrema()
+                    if alpha_extrema[0] < 255:
+                        palette_data = self.image.palette.getdata()[1]
+                        # Palette may be RGB (3 bytes/entry) or RGBA (4 bytes/entry)
+                        bpp = 4 if len(palette_data) == 256 * 4 else 3
+                        # Build set of unique RGBA pixel values from tobytes()
+                        raw = rgba_check.tobytes()
+                        unique_colors = {
+                            (raw[i], raw[i + 1], raw[i + 2], raw[i + 3])
+                            for i in range(0, len(raw), 4)
+                        }
+                        for idx in range(256):
+                            if bpp == 4:
+                                transparent_bytes = (
+                                    palette_data[idx * 4],
+                                    palette_data[idx * 4 + 1],
+                                    palette_data[idx * 4 + 2],
+                                    palette_data[idx * 4 + 3],
+                                )
+                            else:
+                                transparent_bytes = (
+                                    palette_data[idx * 3],
+                                    palette_data[idx * 3 + 1],
+                                    palette_data[idx * 3 + 2],
+                                    0,
+                                )
+                            if transparent_bytes in unique_colors:
+                                self.image.info["transparency"] = idx
+                                break
 
         ext = requested_extension or self.get_default_extension()
 
